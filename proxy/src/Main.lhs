@@ -27,10 +27,11 @@ propagated to all parties.
 > import Control.Exception (finally)
 > import Control.Monad (forever)
 > import Data.Foldable (forM_)
-> import Control.Concurrent (MVar, newMVar, modifyMVar_, modifyMVar, readMVar)
+> import Control.Concurrent (MVar, newMVar, modifyMVar_, modifyMVar, readMVar, myThreadId)
 > import Data.Aeson
 > import GHC.Generics
 > import Control.Concurrent.Event ( Event )
+> import Data.Ord (comparing)
 > import qualified Control.Concurrent.Event as Event
 > import qualified Data.List as List
 > import qualified Data.Text as T
@@ -63,12 +64,28 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 > instance FromJSON Protocol
 > instance ToJSON Protocol
 
+> data Message 
+>   = Message
+>   { to :: Role
+>   , body :: Text
+>   } deriving (Generic, Show)
+> instance FromJSON Message
+> instance ToJSON Message
+
 > data Session 
 >   = Session 
 >   { clients :: Map.Map Role WS.Connection
 >   , roles   :: Set.Set (Role, Ident)
 >   , token :: Integer
->   }
+>   } 
+
+> instance Show Session where
+>   show (Session _ rs t) = "Session " ++ show t ++ ": " ++ show rs
+
+> instance Eq Session where
+>   p == p' =  (token :: Session -> Integer) p == (token :: Session -> Integer) p'
+> instance Ord Session where
+>   compare = comparing (token :: Session -> Integer)
 
 > data Pending
 >   = Pending
@@ -80,6 +97,14 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   , ready    :: Event
 >   }
 
+> instance Show Pending where
+>   show (Pending p _ rs wrs t _) = "Pending: " ++ show p ++ " " ++ show rs ++ " |waiting: " ++ show wrs ++ " | token: " ++ show t
+
+> instance Eq Pending where
+>   p == p' =  (token :: Pending -> Integer) p == (token :: Pending -> Integer) p'
+> instance Ord Pending where
+>   compare = comparing (token :: Pending -> Integer)
+
 > data SessionReq
 >   = Req
 >   { protocol :: Protocol
@@ -89,14 +114,21 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   } deriving (Generic, Show)
 
 > instance FromJSON SessionReq
+> instance ToJSON SessionReq
+
+> example = Req (Protocol "TwoBuyer") roles (Ident "Jonathan") (Role "Buyer1")
+>   where
+>     roles = Set.fromList [(Role "Buyer1", Ident "Jonathan"), (Role "Buyer2",
+>               Ident "Nick"), (Role "Seller", Ident "Nobuko")]
 
 The connection handler needs to have some way to 'get' the connection of another
 role in the session in order to forward the message.
 
-> type ProxyState = ([Session], [Pending], Integer)
+> type Token = Integer
+> type ProxyState = (Map.Map Token Session, Map.Map Token Pending, Integer)
 
 > newProxyState :: ProxyState
-> newProxyState = ([],[], 0)
+> newProxyState = (Map.empty, Map.empty, 0)
 
 Go through the pending states and see if any of them are waiting for this client
 to connect. If a request matches an existing pending session it will be
@@ -112,58 +144,76 @@ There are four possible cases:
 
 
 > -- Pre: No waiting roles
-> initSession :: Pending -> MVar ProxyState -> IO ProxyState
+> initSession :: Pending -> MVar ProxyState -> IO ()
 > initSession (Pending p cs rs _ tok ready) sv = do
 >   forM_ cs setup
 >   Event.set ready
->   modifyMVar sv (\(ss, pend, i) -> let s = ((Session cs rs tok) : ss, pend, i) in return (s, s))
+>   modifyMVar_ sv (\(ss, pend, i) -> let s = (Map.insert tok (Session cs rs tok) ss, pend, i) in return s)
 >   where
 >     setup conn = do
 >       flip finally disconnect $ do
 >         WS.sendTextData conn (encode rs)
->     teardown (ss', pend', i') = do  
+>     disconnect = do  
 >       forM_ cs (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
->       let ss'' = filter ((/= tok) . (token :: Session -> Integer)) ss'
->       return (ss'', pend', i')
+>       modifyMVar_ sv (\(ss'', pend'', i) -> return (Map.delete tok ss'', pend'', i))
 
-Remove the session from the state
-
->       return undefined
->     disconnect = modifyMVar_ sv teardown
-
-> data Handled = UpdatedState | AlreadyTaken | StartSession Pending
+> data Handled = UpdatedState Integer | AlreadyTaken | StartSession Pending
 
 > handleReq :: ProxyState -> SessionReq -> WS.Connection -> IO (ProxyState, Handled)
 > handleReq state@(ss, pend, i) (Req p rs ident r) conn
->   = case filter pred pend of
->       [] -> do
+>   = case Map.lookupMin $ Map.filter pred pend of
+>       Nothing -> do
 >          e <- Event.new
->          return ((ss, new e : pend, i + 1), UpdatedState) -- Case 1.
->       [Pending p' cs' rs' wrs' tok ready]
+>          return ((ss, Map.insert i (new e) pend, i + 1), UpdatedState i) -- Case 1.
+>       (Just (_, Pending p' cs' rs' wrs' tok ready))
 >         | Set.member r wrs' && Set.size wrs' > 1  -- Case 2.
->            -> return ((ss, updated : pend', i), UpdatedState)
+>            -> return ((ss, Map.insert tok updated pend', i), UpdatedState tok)
 >         | Set.member r wrs' -> return ((ss, pend', i), StartSession updated) -- Case 3.
 >         | otherwise -> return (state, AlreadyTaken) -- Case 4.
 >         where
 >           updated = Pending p' (Map.insert r conn cs') (Set.insert (r, ident) rs') (Set.delete r wrs') tok ready
 >   where
 >     pred (Pending p' _ rs' _ _ _) = p == p' && rs == rs'
->     pend' = filter (not . pred) pend
+>     pend' = Map.filter (not . pred) pend
 >     new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs) i
 
 > proxy :: MVar ProxyState -> WS.ServerApp
 > proxy sv pending = do
 >   conn <- WS.acceptRequest pending
->   WS.forkPingThread conn 30
+>   readMVar sv >>= print 
 >   mreq <- decode <$> WS.receiveData conn
+>   WS.forkPingThread conn 30
+>   WS.sendTextData conn (encode example)
 >   case mreq of
 >     Nothing -> WS.sendClose conn ("Invalid proxy request" :: Text)
 >     Just req -> do
 >       h <- modifyMVar sv (\state -> handleReq state req conn)
 >       case h of
->         (StartSession pend) -> undefined
+>         (StartSession pend) -> do
+>           initSession pend sv
+>           comm conn sv ((token :: Pending -> Token) pend)
 >         AlreadyTaken -> WS.sendClose conn ("Role has already been taken" :: Text)
->         UpdatedState -> undefined
+>         (UpdatedState tok) -> comm conn sv tok
+
+> comm :: WS.Connection -> MVar ProxyState -> Integer -> IO ()
+> comm conn sv tok = do 
+>   (_, pend,_) <- readMVar sv
+>   case fmap (ready :: Pending -> Event) $ Map.lookup tok pend of
+>     (Just e) -> Event.wait e
+>     Nothing -> return ()
+>   myThreadId >>= \i -> print $ "foo " ++ show i
+>   (ss, _, _) <- readMVar sv
+>   let (Just cs) = fmap (clients :: Session -> Map.Map Role WS.Connection) $ Map.lookup tok ss 
+>   forever $ do
+>     (Just (Message r msg)) <- decode <$> WS.receiveData conn
+>     let (Just conn) = Map.lookup r cs
+>     WS.sendTextData conn msg
+>     print msg
+
+> main :: IO ()
+> main = do
+>     state <- newMVar newProxyState
+>     WS.runServer "127.0.0.1" 9160 $ proxy state
 
 The state kept on the server is simply a list of connected clients. We've added
 an alias and some utility functions, so it will be easier to extend this state
@@ -212,10 +262,10 @@ The main function first creates a new state for the server, then spawns the
 actual server. For this purpose, we use the simple server provided by
 `WS.runServer`.
 
-> main :: IO ()
-> main = do
->     state <- newMVar newServerState
->     WS.runServer "127.0.0.1" 9160 $ application state
+main :: IO ()
+main = do
+    state <- newMVar newServerState
+    WS.runServer "127.0.0.1" 9160 $ application state
 
 
 Our main application has the type:
