@@ -30,6 +30,8 @@ propagated to all parties.
 > import Control.Concurrent (MVar, newMVar, modifyMVar_, modifyMVar, readMVar)
 > import Data.Aeson
 > import GHC.Generics
+> import Control.Concurrent.Event ( Event )
+> import qualified Control.Concurrent.Event as Event
 > import qualified Data.List as List
 > import qualified Data.Text as T
 > import qualified Data.Text.IO as T
@@ -65,7 +67,7 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   = Session 
 >   { clients :: Map.Map Role WS.Connection
 >   , roles   :: Set.Set (Role, Ident)
->   , session :: Integer
+>   , token :: Integer
 >   }
 
 > data Pending
@@ -74,6 +76,8 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   , clients  :: Map.Map Role WS.Connection
 >   , roles    :: Set.Set (Role, Ident)
 >   , waiting  :: Set.Set Role
+>   , token    :: Integer
+>   , ready    :: Event
 >   }
 
 > data SessionReq
@@ -108,17 +112,18 @@ There are four possible cases:
 
 
 > -- Pre: No waiting roles
-> initSession :: Pending -> ProxyState -> MVar ProxyState -> IO ProxyState
-> initSession (Pending p cs rs _) (ss, pend, i) sv = do
+> initSession :: Pending -> MVar ProxyState -> IO ProxyState
+> initSession (Pending p cs rs _ tok ready) sv = do
 >   forM_ cs setup
->   return ((Session cs rs i) : ss, pend, i + 1)
+>   Event.set ready
+>   modifyMVar sv (\(ss, pend, i) -> let s = ((Session cs rs tok) : ss, pend, i) in return (s, s))
 >   where
 >     setup conn = do
 >       flip finally disconnect $ do
 >         WS.sendTextData conn (encode rs)
 >     teardown (ss', pend', i') = do  
 >       forM_ cs (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
->       let ss'' = filter ((/= i) . session) ss'
+>       let ss'' = filter ((/= tok) . (token :: Session -> Integer)) ss'
 >       return (ss'', pend', i')
 
 Remove the session from the state
@@ -126,24 +131,25 @@ Remove the session from the state
 >       return undefined
 >     disconnect = modifyMVar_ sv teardown
 
-> handleReq :: ProxyState -> SessionReq -> WS.Connection -> MVar ProxyState -> IO ProxyState
-> handleReq state@(ss, pend, i) (Req p rs ident r) conn sv
+> data Handled = UpdatedState | AlreadyTaken | StartSession Pending
+
+> handleReq :: ProxyState -> SessionReq -> WS.Connection -> IO (ProxyState, Handled)
+> handleReq state@(ss, pend, i) (Req p rs ident r) conn
 >   = case filter pred pend of
->       [] -> return (ss, new : pend, i) -- Case 1.
->       [Pending p' cs' rs' wrs']
+>       [] -> do
+>          e <- Event.new
+>          return ((ss, new e : pend, i + 1), UpdatedState) -- Case 1.
+>       [Pending p' cs' rs' wrs' tok ready]
 >         | Set.member r wrs' && Set.size wrs' > 1  -- Case 2.
->            -> return (ss, updated : pend', i)
->         | Set.member r wrs' -> initSession updated (ss, pend', i) sv -- Case 3.
->         | otherwise -> do -- Case 4.
->           WS.sendClose conn ("Role has already been taken" :: Text)
->           return state
+>            -> return ((ss, updated : pend', i), UpdatedState)
+>         | Set.member r wrs' -> return ((ss, pend', i), StartSession updated) -- Case 3.
+>         | otherwise -> return (state, AlreadyTaken) -- Case 4.
 >         where
->           updated = Pending p' (Map.insert r conn cs') (Set.insert (r, ident) rs') (Set.delete r wrs') 
->
+>           updated = Pending p' (Map.insert r conn cs') (Set.insert (r, ident) rs') (Set.delete r wrs') tok ready
 >   where
->     pred (Pending p' _ rs' _) = p == p' && rs == rs'
+>     pred (Pending p' _ rs' _ _ _) = p == p' && rs == rs'
 >     pend' = filter (not . pred) pend
->     new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs)
+>     new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs) i
 
 > proxy :: MVar ProxyState -> WS.ServerApp
 > proxy sv pending = do
@@ -152,13 +158,18 @@ Remove the session from the state
 >   mreq <- decode <$> WS.receiveData conn
 >   case mreq of
 >     Nothing -> WS.sendClose conn ("Invalid proxy request" :: Text)
->     Just req -> modifyMVar_ sv (\state -> handleReq state req conn sv)
-
-> type Client = (Text, WS.Connection)
+>     Just req -> do
+>       h <- modifyMVar sv (\state -> handleReq state req conn)
+>       case h of
+>         (StartSession pend) -> undefined
+>         AlreadyTaken -> WS.sendClose conn ("Role has already been taken" :: Text)
+>         UpdatedState -> undefined
 
 The state kept on the server is simply a list of connected clients. We've added
 an alias and some utility functions, so it will be easier to extend this state
 later on.
+
+> type Client = (Text, WS.Connection)
 
 > type ServerState = [Client]
 

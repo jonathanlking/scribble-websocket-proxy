@@ -21,3 +21,4 @@ executable scribble-playground-server
                      , wai-app-static
                      , aeson
                      , containers
+                     , concurrent-extra
