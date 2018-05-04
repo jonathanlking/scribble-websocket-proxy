@@ -63,8 +63,9 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 
 > data Session 
 >   = Session 
->   { clients  :: Map.Map Role WS.Connection
->   , roles    :: Set.Set (Role, Ident)
+>   { clients :: Map.Map Role WS.Connection
+>   , roles   :: Set.Set (Role, Ident)
+>   , session :: Integer
 >   }
 
 > data Pending
@@ -88,10 +89,10 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 The connection handler needs to have some way to 'get' the connection of another
 role in the session in order to forward the message.
 
-> type ProxyState = ([Session], [Pending])
+> type ProxyState = ([Session], [Pending], Integer)
 
 > newProxyState :: ProxyState
-> newProxyState = ([],[])
+> newProxyState = ([],[], 0)
 
 Go through the pending states and see if any of them are waiting for this client
 to connect. If a request matches an existing pending session it will be
@@ -107,91 +108,51 @@ There are four possible cases:
 
 
 > -- Pre: No waiting roles
-> initSession :: Pending -> ProxyState -> IO ProxyState
-> initSession (Pending p cs rs _) (ss, pend) = do
->   let info = encode rs
->   forM_ cs (\conn -> do
->--     flip finally disconnect $ do
->--             disconnect = do
->--                 -- Remove client and return new state
->--                 s <- modifyMVar state $ \s ->
->--                     let s' = removeClient client s in return (s', s')
->--                 broadcast (fst client `mappend` " disconnected") s
+> initSession :: Pending -> ProxyState -> MVar ProxyState -> IO ProxyState
+> initSession (Pending p cs rs _) (ss, pend, i) sv = do
+>   forM_ cs setup
+>   return ((Session cs rs i) : ss, pend, i + 1)
+>   where
+>     setup conn = do
+>       flip finally disconnect $ do
+>         WS.sendTextData conn (encode rs)
+>     teardown (ss', pend', i') = do  
+>       forM_ cs (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
+>       let ss'' = filter ((/= i) . session) ss'
+>       return (ss'', pend', i')
 
->     WS.sendTextData conn info)
->   return ((Session cs rs) : ss, pend)
+Remove the session from the state
 
-> req :: ProxyState -> SessionReq -> WS.Connection -> IO ProxyState
-> req state@(ss, pend) (Req p rs i r) conn
+>       return undefined
+>     disconnect = modifyMVar_ sv teardown
+
+> handleReq :: ProxyState -> SessionReq -> WS.Connection -> MVar ProxyState -> IO ProxyState
+> handleReq state@(ss, pend, i) (Req p rs ident r) conn sv
 >   = case filter pred pend of
->       [] -> return (ss, new : pend) -- Case 1.
+>       [] -> return (ss, new : pend, i) -- Case 1.
 >       [Pending p' cs' rs' wrs']
 >         | Set.member r wrs' && Set.size wrs' > 1  -- Case 2.
->            -> return (ss, updated : pend')
->         | Set.member r wrs' -> initSession updated (ss, pend') -- Case 3.
+>            -> return (ss, updated : pend', i)
+>         | Set.member r wrs' -> initSession updated (ss, pend', i) sv -- Case 3.
 >         | otherwise -> do -- Case 4.
 >           WS.sendClose conn ("Role has already been taken" :: Text)
 >           return state
 >         where
->           updated = Pending p' (Map.insert r conn cs') rs' (Set.delete r wrs') 
+>           updated = Pending p' (Map.insert r conn cs') (Set.insert (r, ident) rs') (Set.delete r wrs') 
 >
 >   where
 >     pred (Pending p' _ rs' _) = p == p' && rs == rs'
 >     pend' = filter (not . pred) pend
 >     new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs)
 
-
-  = case List.findIndex (\(Pending p' _ rs' _) -> p == p' && rs == rs') pend of
-      Nothing -> return $ (ss, new : pend) -- 1.
-      (Just i) -> case (pend !! i) of
-        x@(Pending p' cs' rs' wrs')
-          | Set.member r wrs' && Set.size wrs' > 1 -> undefined
-          | otherwise -> undefined
-          where
-            pend' = List.delete x pend
-            updated = (Pending p' cs' rs' (Set.delete r wrs'))
-  where
-    new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs)
-
-
-req :: ProxyState -> SessionReq -> WS.Connection -> IO ProxyState
-req (ss, pend) (Req p rs i r) conn
-  = case foldl f ([], False) pend of
-      (_, False)    -> (ss, new : pend)
-      (pend', True) -> (ss, pend')
-  where
-    f (xs, flag) x@(Pending p' cs' rs' wrs')
-      | p /= p' || rs /= rs' = (x : xs, flag)
-      | Set.member r wrs' && Set.size wrs' > 1 =  
-      | otherwise = undefined -- They have tried to connect twice
-      where
-        updated = ((Pending p' cs' rs' (Set.delete r wrs')), True)
-    new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs)
-
-> handleReq :: ProxyState -> SessionReq -> Maybe ProxyState
-> handleReq (ss, pend) req
->   = fmap ((,) ss) pend'
->   where
->     pend' = sequence $ fmap (try req) pend
->     try :: SessionReq -> Pending -> Maybe Pending
->     try (Req p rs i r) x@(Pending p' cs rs' wrs)
->       | p /= p' || rs /= rs' = Just x
->       | Set.member r wrs     = Just $ Pending p' cs rs' (Set.delete r wrs)
-
--- TODO: check if last member and if so we now need to initialse the session!
-
->       | otherwise            = Nothing
-
 > proxy :: MVar ProxyState -> WS.ServerApp
 > proxy sv pending = do
 >   conn <- WS.acceptRequest pending
 >   WS.forkPingThread conn 30
->   req <- decode <$> WS.receiveData conn
->   state <- readMVar sv
->   case req >>= handleReq state of
->     (Just state') -> 
->        WS.sendTextData conn ("Invalid request" :: Text)
->     Nothing       -> undefined
+>   mreq <- decode <$> WS.receiveData conn
+>   case mreq of
+>     Nothing -> WS.sendClose conn ("Invalid proxy request" :: Text)
+>     Just req -> modifyMVar_ sv (\state -> handleReq state req conn sv)
 
 > type Client = (Text, WS.Connection)
 
