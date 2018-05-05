@@ -1,0 +1,25 @@
+name:                scribble-playground-server
+version:             0.1.0.0
+-- synopsis:
+-- description:
+author:              Jonathan King
+maintainer:          jonathanlking@me.com
+copyright:           Copyright: (c) 2018 Jonathan King
+category:            Web
+build-type:          Simple
+cabal-version:       >=1.10
+
+executable scribble-proxy
+  hs-source-dirs:      src
+  main-is:             Main.lhs
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N
+  default-language:    Haskell2010
+  build-depends:       base >= 4.7 && < 5
+                     , foundation
+                     , websockets
+                     , text
+                     , warp
+                     , wai-app-static
+                     , aeson
+                     , containers
+                     , concurrent-extra
