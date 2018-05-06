@@ -24,7 +24,7 @@ propagated to all parties.
 > import Data.Char (isPunctuation, isSpace)
 > import Data.Monoid (mappend)
 > import Data.Text (Text)
-> import Control.Exception (finally)
+> import Control.Exception (finally, getMaskingState)
 > import Control.Monad (forever)
 > import Data.Foldable (forM_)
 > import Control.Concurrent (MVar, newMVar, modifyMVar_, modifyMVar, readMVar, myThreadId)
@@ -222,7 +222,8 @@ main = do
 >   state <- newState >>= newMVar
 >   WS.runServer "127.0.0.1" 9160 $ application state
 
-> type State = ((Maybe WS.Connection, Maybe WS.Connection, Maybe WS.Connection), Event)
+> type State' = (Maybe WS.Connection, Maybe WS.Connection, Maybe WS.Connection)
+> type State = (State', Event)
 
 > newState :: IO State
 > newState = (,) (Nothing, Nothing, Nothing) <$> Event.new
@@ -245,8 +246,13 @@ main = do
 >           Event.set e
 >           putStrLn "All parties present, time to send messages!"
 >         else putStrLn "Still waiting for more people to join!"
+>         putStrLn "masky!"
+>         ms <- getMaskingState
+>         putStrLn (show ms ++ " ms")
 >         Event.wait e
->         proxy conn state 
+>         putStrLn "after"
+>         cons <- fst <$> readMVar state
+>         proxy conn cons
 >     Nothing -> putStrLn "Connection rejected as slots are full!"
 >   where
 >     accept s@(slots, e) = do
@@ -258,10 +264,12 @@ main = do
 >         WS.forkPingThread conn 30
 >         let s' = (insert (Just conn) slots, e)
 >         return (s', Just (s', conn))
->     disconnect = modifyMVar state $ \(slots, _) -> do
->         forM_ (extract slots) (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
->         s <- newState
->         return (s, s)
+>     disconnect = do
+>         putStrLn "Somone disconnected"
+>         modifyMVar state $ \(slots, _) -> do
+>           forM_ (extract slots) (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
+>           s <- newState
+>           return (s, s)
 
 > extract (x, y, z) = catMaybes [x, y, z]
 
@@ -284,9 +292,8 @@ main = do
 > select Two (_, y, _)   = y
 > select Three (_, _, z) = z
 
-> proxy :: WS.Connection -> MVar State -> IO ()
-> proxy conn state = forever $ do
->   cons <- fst <$> readMVar state
+> proxy :: WS.Connection -> State' -> IO ()
+> proxy conn cons = forever $ do
 >   msg <- decode <$> WS.receiveData conn
 >   case msg >>= (\(Message t b) -> (,) b <$> select t cons) of
 >     Nothing -> return ()
