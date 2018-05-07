@@ -11,7 +11,7 @@ establish communication channels between all roles. It is difficult however to
 open a direct peer to peer connection between two web browsers, as you might not
 know the IP address of the browser you want to connect to (and incoming requests
 might be blocked). The aim of this proxy is to provide a single statically known
-address where all parties can connect and sent and receive messages from.
+address where all parties can connect and send and receive messages from.
 Messages are correctly routed to the correct role and network failure events are
 propagated to all parties.
 
@@ -38,17 +38,17 @@ Required for generic-lens:
 > import Data.Function (on)
 > import Control.Exception (finally, getMaskingState)
 > import Control.Monad (forever)
-> import Control.Lens
+> import Control.Lens ((%~), (&), (.~))
 > import Data.Foldable (forM_)
 > import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar)
-> import Data.Aeson
-> import GHC.Generics
+> import Data.Aeson (encode, decode, ToJSON, FromJSON, ToJSONKey, FromJSONKey)
+> import GHC.Generics (Generic)
 > import Control.Concurrent.Event (Event)
 > import Data.Map.Strict (Map)
 > import Data.Set (Set)
 > import Data.Ord (comparing)
 > import Data.Maybe (catMaybes)
-> import Data.Generics.Product
+> import Data.Generics.Product (getField, field, upcast)
 > import qualified Control.Concurrent.Event as Event
 > import qualified Data.List as List
 > import qualified Data.Text as T
@@ -129,10 +129,10 @@ stored in Maps.
 >   compare = comparing (token :: Session -> Integer)
 
 Cannot derive Eq/Ord for Pending because WS.Connection doesn't isn't an instance
-+ it only makes sense to compare on protocol and assignments (as this uniquely
+and it only makes sense to compare on protocol and assignments (as this uniquely
 identifies any pending connection). Instead of writing the instances by hand
 though we can make a duplicate (smaller) data type which we can derive the
-instances for!
+instances for automatically!
 
 > data PendingOrd
 >  = PendingOrd
@@ -161,9 +161,6 @@ instances for!
 >               Ident "Bob"), (Role "Seller", Ident "Sarah")]
 >     roles = Set.fromList [Role "Buyer1", Role "Buyer2", Role "Seller"]
 
-The connection handler needs to have some way to 'get' the connection of another
-role in the session in order to forward the message.
-
 > type Token = Integer
 > type PendingKey = (Protocol, Map Role Ident)
 
@@ -174,13 +171,17 @@ role in the session in order to forward the message.
 >   , nextToken :: Token
 >   } deriving (Generic)
 
+The server start with no pending or active sessions and an initial token of 0.
+
 > newState :: State
 > newState = State Map.empty Map.empty 0
 
-Go through the pending states and see if any of them are waiting for this client
-to connect. If a request matches an existing pending session it will be
-rejected. This is to prevent competing request groups which could result in a
-deadlock.
+The 'matchmaking' part of the proxy works as follows:
+
+On receiving a new socket request, go through the pending states and see if any
+of them are waiting for this client to connect. If a request matches an existing
+pending session it will be rejected. 
+This is to prevent competing request groups which could result in a deadlock.
 
 There are three possible cases:
 
@@ -288,19 +289,19 @@ states.
 >                   putMVar stateV state'
 >                   seq state' (return ())
 
-Set the 'assembled' event, so the other clients can now continue to the 'proxy'
-stage.
+Set the 'assembled' event, so the other clients can now continue to the
+'routing' phase.
 
 >                   Event.set e
 >           Event.wait e
 
-The following will only be executed once the session has started
+The following will only be executed once the session has started:
 
 >           ss <- sessions <$> readMVar stateV
 >           case Map.lookup tok ss of
 
 The session is over before this client even got a chance to communicate... This
-is because another client disconnected and destroyed the session.
+is because another client disconnected and destroyed the session concurrently.
 
 >             Nothing -> return ()
 
