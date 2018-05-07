@@ -28,7 +28,7 @@ propagated to all parties.
 > import Control.Exception (finally, getMaskingState)
 > import Control.Monad (forever)
 > import Data.Foldable (forM_)
-> import Control.Concurrent (MVar, newMVar, modifyMVar_, modifyMVar, readMVar, myThreadId)
+> import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar)
 > import Data.Aeson
 > import GHC.Generics
 > import Control.Concurrent.Event (Event)
@@ -152,77 +152,99 @@ role in the session in order to forward the message.
 
 > type Token = Integer
 > type PendingKey = (Protocol, Map Role Ident)
-> type ProxyState = ( Map Token (MVar Session)
->                   , Map PendingKey (MVar Pending)
->                   , Token
->                   )
 
-> newProxyState :: ProxyState
-> newProxyState = (Map.empty, Map.empty, 0)
+> data State
+>   = State
+>   { sessions  :: Map Token (MVar Session)
+>   , pending   :: Map PendingKey (MVar Pending)
+>   , nextToken :: Token
+>   }
 
-> application :: MVar State -> WS.ServerApp
-> application state pending = do
->   res <- modifyMVar state accept
->   case res of
->     Just ((slots, e), conn) 
->       -> flip finally disconnect $ do
->         if full slots then do 
->           Event.set e
->           putStrLn "All parties present, time to send messages!"
->         else putStrLn "Still waiting for more people to join!"
->         putStrLn "masky!"
->         ms <- getMaskingState
->         putStrLn (show ms ++ " ms")
->         Event.wait e
->         putStrLn "after"
->         cons <- fst <$> readMVar state
->         proxy conn cons
->     Nothing -> putStrLn "Connection rejected as slots are full!"
->   where
->     accept s@(slots, e) = do
->       if full slots then do
->         WS.rejectRequest pending "Slots are currently full"
->         return (s, Nothing)
->       else do 
->         conn <- WS.acceptRequest pending
->         WS.forkPingThread conn 30
->         let s' = (insert (Just conn) slots, e)
->         return (s', Just (s', conn))
->     disconnect = do
->         putStrLn "Somone disconnected"
->         modifyMVar state $ \(slots, _) -> do
->           forM_ (extract slots) (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
->           s <- newState
->           return (s, s)
-
-
+> newState :: State
+> newState = State Map.empty Map.empty 0
 
 Go through the pending states and see if any of them are waiting for this client
 to connect. If a request matches an existing pending session it will be
 rejected. This is to prevent competing request groups which could result in a
 deadlock.
 
-There are four possible cases:
+There are three possible cases:
 
-1. No Pending - so create a new one
-2. Pending - role not taken - so take it
-3. Pending - now complete - should start session and become Session
-4. Pending - role already taken - throw an error
+1. No pending sessions -> create a new pending session
+Pending: 
+    2. Role already taken -> throw an error
+    3. Role not taken -> take it
+
+If all roles now connected -> set the `assembled` event
+
+(Note that we must set the assembled event _before_ the final role starts the
+proxy phase, otherwise we would block forever)
+
+> application :: MVar State -> WS.ServerApp
+> application stateV pend = do
+>   conn <- WS.acceptRequest pend
+>   mreq <- decode <$> WS.receiveData conn
+>   case mreq of
+>     Nothing -> WS.sendClose conn ("Could not parse proxy request" :: Text)
+>     Just (Req prot ass r) -> do
+>       state <- takeMVar stateV
+>       let entry = Map.lookup (prot, ass) (pending state)
+>       case entry of
+>         Nothing  -> do
+>           -- Case 1.
+>           newPendV <- newEmptyMVar
+>           let state' = state { pending = Map.insert (prot, ass) newPendV (pending state) }
+>           putMVar stateV state'
+>           seq state' (return ()) -- force evaluation
+
+We now have a 'lock' on the new pending session, which has been added to the
+global state, so it's safe to release our lock on the global state.
+
+We should now create our new pending session and put it in the MVar, 'releasing'
+the lock on it.
+
+>           e <- Event.new
+>           let newPend = Pending 
+>                   { protocol = prot
+>                   , clients = Map.insert r conn Map.empty
+>                   , assignments = ass 
+>                   , waiting = Set.delete r $ Map.keysSet ass
+>                   , assembled = e
+>                   }
+>           putMVar newPendV newPend
+>           seq newPend (return ()) -- force evaluation
 
 
--- Pre: No waiting roles
-initSession :: Pending -> MVar ProxyState -> IO ()
-initSession (Pending p cs rs _ tok ready) sv = do
-  forM_ cs setup
-  Event.set ready
-  modifyMVar_ sv (\(ss, pend, i) -> let s = (Map.insert tok (Session cs rs tok) ss, pend, i) in return s)
-  where
-    setup conn = do
-      flip finally disconnect $ do
-        WS.sendTextData conn (encode rs)
-    disconnect = do  
-      forM_ cs (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
-      modifyMVar_ sv (\(ss'', pend'', i) -> return (Map.delete tok ss'', pend'', i))
+>         (Just pv) -> do
+>           -- Cases 2/3.
+>           p <- takeMVar pv
+
+We now no longer need a lock on the global state as we are only interested in
+this particular pending session, which we have now locked.
+
+>           putMVar stateV state
+>           -- 2/3.
+>           
+>           return undefined  
+
+  case res of
+    Just ((slots, e), conn) 
+      -> flip finally disconnect $ do
+        if full slots then do 
+          Event.set e
+          putStrLn "All parties present, time to send messages!"
+        else putStrLn "Still waiting for more people to join!"
+        putStrLn "masky!"
+        ms <- getMaskingState
+        putStrLn (show ms ++ " ms")
+        Event.wait e
+        putStrLn "after"
+        cons <- fst <$> readMVar state
+        proxy conn cons
+    Nothing -> putStrLn "Connection rejected as slots are full!"
+
+>  where
+>    accept = undefined
 
 data Handled = UpdatedState Integer | AlreadyTaken | StartSession Pending
 
@@ -243,6 +265,39 @@ handleReq state@(ss, pend, i) (Req p rs ident r) conn
     pred (Pending p' _ rs' _ _ _) = p == p' && rs == rs'
     pend' = Map.filter (not . pred) pend
     new = Pending p (Map.insert r conn Map.empty) rs (Set.delete r $ Set.map fst rs) i
+
+
+    accept s@(slots, e) = do
+      if full slots then do
+        WS.rejectRequest pending "Slots are currently full"
+        return (s, Nothing)
+      else do 
+        conn <- WS.acceptRequest pending
+        WS.forkPingThread conn 30
+        let s' = (insert (Just conn) slots, e)
+        return (s', Just (s', conn))
+    disconnect = do
+        putStrLn "Somone disconnected"
+        modifyMVar state $ \(slots, _) -> do
+          forM_ (extract slots) (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
+          s <- newState
+          return (s, s)
+
+
+
+-- Pre: No waiting roles
+initSession :: Pending -> MVar ProxyState -> IO ()
+initSession (Pending p cs rs _ tok ready) sv = do
+  forM_ cs setup
+  Event.set ready
+  modifyMVar_ sv (\(ss, pend, i) -> let s = (Map.insert tok (Session cs rs tok) ss, pend, i) in return s)
+  where
+    setup conn = do
+      flip finally disconnect $ do
+        WS.sendTextData conn (encode rs)
+    disconnect = do  
+      forM_ cs (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
+      modifyMVar_ sv (\(ss'', pend'', i) -> return (Map.delete tok ss'', pend'', i))
 
 proxyOld :: MVar ProxyState -> WS.ServerApp
 proxyOld sv pending = do
@@ -279,7 +334,7 @@ comm conn sv tok = do
 
 main :: IO ()
 main = do
-    state <- newMVar newProxyState
+    state <- newMVar newState
     WS.runServer "0.0.0.0" 9160 $ proxyOld state
 
 ================================================
@@ -289,14 +344,14 @@ Slot based proxy
 > main :: IO ()
 > main = do
 >   print $ encode $ SMessage One "Hello world!"
->   state <- newState >>= newMVar
+>   state <- newState' >>= newMVar
 >   WS.runServer "127.0.0.1" 9160 $ slotApplication state
 
-> type State' = (Maybe WS.Connection, Maybe WS.Connection, Maybe WS.Connection)
-> type State = (State', Event)
+> type SlotState' = (Maybe WS.Connection, Maybe WS.Connection, Maybe WS.Connection)
+> type SlotState = (SlotState', Event)
 
-> newState :: IO State
-> newState = (,) (Nothing, Nothing, Nothing) <$> Event.new
+> newState' :: IO SlotState
+> newState' = (,) (Nothing, Nothing, Nothing) <$> Event.new
 
 > full ((Just _), (Just _), (Just _)) = True
 > full _ = False
@@ -306,7 +361,7 @@ Slot based proxy
 > insert z (x, y, Nothing) = (x, y, z)
 > insert _ _ = error "full!"
 
-> slotApplication :: MVar State -> WS.ServerApp
+> slotApplication :: MVar SlotState -> WS.ServerApp
 > slotApplication state pending = do
 >   res <- modifyMVar state accept
 >   case res of
@@ -338,7 +393,7 @@ Slot based proxy
 >         putStrLn "Somone disconnected"
 >         modifyMVar state $ \(slots, _) -> do
 >           forM_ (extract slots) (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
->           s <- newState
+>           s <- newState'
 >           return (s, s)
 
 > extract (x, y, z) = catMaybes [x, y, z]
@@ -362,7 +417,7 @@ Slot based proxy
 > select Two (_, y, _)   = y
 > select Three (_, _, z) = z
 
-> proxy :: WS.Connection -> State' -> IO ()
+> proxy :: WS.Connection -> SlotState' -> IO ()
 > proxy conn cons = forever $ do
 >   msg <- decode <$> WS.receiveData conn
 >   case msg >>= (\(SMessage t b) -> (,) b <$> select t cons) of
