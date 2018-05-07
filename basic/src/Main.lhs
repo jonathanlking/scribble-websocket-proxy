@@ -25,8 +25,6 @@ For generic-lens...
 
 > {-# LANGUAGE AllowAmbiguousTypes       #-}
 > {-# LANGUAGE DataKinds                 #-}
-> {-# LANGUAGE DeriveGeneric             #-}
-> {-# LANGUAGE DuplicateRecordFields     #-}
 > {-# LANGUAGE FlexibleContexts          #-}
 > {-# LANGUAGE NoMonomorphismRestriction #-}
 > {-# LANGUAGE TypeApplications          #-}
@@ -100,22 +98,23 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   } deriving (Generic)
 
 > instance Show Session where
->   show (Session _ rs t) = "Session " ++ show t ++ ": " ++ show rs
+>   show (Session _ ass tok) = "Session " ++ show tok ++ ": " ++ show ass
 
 > data Pending
 >   = Pending
 >   { protocol    :: Protocol
 >   , clients     :: Map Role WS.Connection
 >   , assignments :: Map Role Ident
+>   , token       :: Integer
 >   , waiting     :: Set Role
 >   , assembled   :: Event
 >   } deriving (Generic)
 
 > instance Show Pending where
->   show (Pending p _ rs wrs _)
->     = unlines [ "Pending: "
+>   show (Pending p _ ass tok wrs _)
+>     = unlines [ "Pending: (" ++ show tok ++ ")"
 >               , show p
->               , show rs 
+>               , show ass 
 >               , "Waiting for: " ++ show wrs
 >               ]
 
@@ -208,9 +207,11 @@ proxy phase, otherwise we would block forever)
 >         Nothing  -> do
 >           -- Case 1.
 >           newPendV <- newEmptyMVar
->           let state' = state { pending = Map.insert (prot, ass) newPendV (pending state) }
+>           let tok = nextToken state
+>           let state' = state & field @"pending" %~ Map.insert (prot, ass) newPendV
+>                              & field @"nextToken" %~ (+1)
 >           putMVar stateV state'
->           seq state' (return ()) -- force evaluation
+>           seq state' (return ())
 
 We now have a 'lock' on the new pending session, which has been added to the
 global state, so it's safe to release our lock on the global state.
@@ -223,15 +224,16 @@ the lock on it.
 >                   { protocol = prot
 >                   , clients = Map.insert role conn Map.empty
 >                   , assignments = ass 
+>                   , token = tok
 >                   , waiting = Set.delete role $ Map.keysSet ass
 >                   , assembled = e
 >                   }
 >           putMVar newPendV newPend
->           seq newPend (return True) -- force evaluation
+>           seq newPend (return (Just (tok, e))) -- force evaluation
 
 
 >         (Just pv) -> do
->           p@(Pending _ cs _ w _) <- takeMVar pv
+>           p@(Pending _ cs _ tok w e) <- takeMVar pv
 
 We now no longer need a lock on the global state as we are only interested in
 this particular pending session, which we have now locked.
@@ -241,30 +243,30 @@ this particular pending session, which we have now locked.
 >             False -> do
 >               -- Case 2.
 >               WS.sendClose conn ("Role has already been taken" :: Text)
->               return False
+>               return Nothing 
 >             True -> do
 >               let p' = p & field @"clients" .~ Map.insert role conn cs
 >                          & field @"waiting" .~ Set.delete role w
 >               putMVar pv p'
->               seq p' (return True)
+>               seq p' (return (Just (tok, e)))
 
 We have released our locks on first the global state and then on the pending session.
 We should check to see if the connection was 'accepted' or not, and if not we should
 check to see if all the roles are now 'assembled'
 
 >       case accepted of
->         False -> return ()
->         True -> do
+>         Nothing -> return ()
+>         (Just (tok, e)) -> do
 >           state <- takeMVar stateV
 >           let entry = Map.lookup (prot, ass) (pending state)
->           accepted <- case entry of
+>           case entry of
 >             Nothing   -> putMVar stateV state
 
 The state has been modified by another thread, so it is no longer pending (now
 an active session) - we can relax!
 
 >             (Just pv) -> do
->               p@(Pending _ cs _ w e) <- takeMVar pv
+>               p@(Pending _ cs _ tok w _) <- takeMVar pv
 >               case Set.null w of
 >                 False -> do
 >                   putMVar pv p
@@ -274,12 +276,10 @@ We are still waiting for more roles to connect - release the pending and global
 states.
 
 >                 True  -> do
->                   let tok = nextToken state
 >                   let sess = Session cs ass tok
 >                   newSessV <- newMVar sess
 >                   let state' = state & field @"sessions" %~ Map.insert tok newSessV
 >                                      & field @"pending" %~ Map.delete (prot, ass)
->                                      & field @"nextToken" %~ (+1)
 >                   putMVar stateV state'
 >                   seq state' (return ())
 
@@ -287,8 +287,31 @@ Set the 'assembled' event, so the other clients can now continue to the 'proxy'
 stage.
 
 >                   Event.set e
+>           Event.wait e
 
->           return undefined  
+The following will only be executed once the session has started
+
+>           ss <- fmap sessions $ readMVar stateV
+>           case Map.lookup tok ss of
+
+The session is over before this client even got a chance to communicate... This
+is because another client disconnected and destroyed the session.
+
+>             Nothing -> return ()
+
+We will get the assignment of roles to connections (once, as this shouldn't
+change during a session) and then proceed to the routing phase.
+
+>             (Just sessV) -> do
+>               cons <- getField @"clients" <$> readMVar sessV
+>               flip finally disconnect $ do
+>                 forever $ do
+>                   msg <- decode <$> WS.receiveData conn
+>                   case msg >>= (\(Message role b) -> (,) b <$> Map.lookup role cons) of
+>                     Nothing -> return () -- TODO: Do we really want to ignore?
+>                     (Just (body, conn)) -> WS.sendTextData conn body
+>               where
+>                 disconnect = undefined
 
 
   case res of
