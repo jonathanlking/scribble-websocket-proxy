@@ -19,6 +19,17 @@ propagated to all parties.
 > {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 > {-# LANGUAGE DuplicateRecordFields #-}
 > {-# LANGUAGE DeriveGeneric #-}
+> {-# LANGUAGE ScopedTypeVariables #-}
+
+For generic-lens...
+
+> {-# LANGUAGE AllowAmbiguousTypes       #-}
+> {-# LANGUAGE DataKinds                 #-}
+> {-# LANGUAGE DeriveGeneric             #-}
+> {-# LANGUAGE DuplicateRecordFields     #-}
+> {-# LANGUAGE FlexibleContexts          #-}
+> {-# LANGUAGE NoMonomorphismRestriction #-}
+> {-# LANGUAGE TypeApplications          #-}
 
 > module Main where
 > import Data.Char (isPunctuation, isSpace)
@@ -27,6 +38,7 @@ propagated to all parties.
 > import Data.Function (on)
 > import Control.Exception (finally, getMaskingState)
 > import Control.Monad (forever)
+> import Control.Lens
 > import Data.Foldable (forM_)
 > import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar)
 > import Data.Aeson
@@ -36,6 +48,7 @@ propagated to all parties.
 > import Data.Set (Set)
 > import Data.Ord (comparing)
 > import Data.Maybe (catMaybes)
+> import Data.Generics.Product
 > import qualified Control.Concurrent.Event as Event
 > import qualified Data.List as List
 > import qualified Data.Text as T
@@ -84,7 +97,7 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   { clients     :: Map Role WS.Connection
 >   , assignments :: Map Role Ident
 >   , token       :: Integer
->   } 
+>   } deriving (Generic)
 
 > instance Show Session where
 >   show (Session _ rs t) = "Session " ++ show t ++ ": " ++ show rs
@@ -96,7 +109,7 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   , assignments :: Map Role Ident
 >   , waiting     :: Set Role
 >   , assembled   :: Event
->   }
+>   } deriving (Generic)
 
 > instance Show Pending where
 >   show (Pending p _ rs wrs _)
@@ -124,12 +137,12 @@ instances for!
 >  = PendingOrd
 >  { protocol :: Protocol
 >  , assignments :: Map Role Ident
->  } deriving (Eq, Ord)
+>  } deriving (Generic, Eq, Ord)
 
 > instance Eq Pending where
->   (==) = on (==) (\(Pending p _ ass _ _) -> PendingOrd p ass)
+>   (==) = on (==) (upcast :: Pending -> PendingOrd)
 > instance Ord Pending where
->   compare = comparing (\(Pending p _ ass _ _) -> PendingOrd p ass)
+>   compare = comparing (upcast :: Pending -> PendingOrd)
 
 > data SessionReq
 >   = Req
@@ -158,7 +171,7 @@ role in the session in order to forward the message.
 >   { sessions  :: Map Token (MVar Session)
 >   , pending   :: Map PendingKey (MVar Pending)
 >   , nextToken :: Token
->   }
+>   } deriving (Generic)
 
 > newState :: State
 > newState = State Map.empty Map.empty 0
@@ -185,11 +198,13 @@ proxy phase, otherwise we would block forever)
 >   conn <- WS.acceptRequest pend
 >   mreq <- decode <$> WS.receiveData conn
 >   case mreq of
->     Nothing -> WS.sendClose conn ("Could not parse proxy request" :: Text)
->     Just (Req prot ass r) -> do
+>     Nothing -> do 
+>       WS.sendClose conn ("Could not parse proxy request" :: Text)
+>       return ()
+>     Just (Req prot ass role) -> do
 >       state <- takeMVar stateV
 >       let entry = Map.lookup (prot, ass) (pending state)
->       case entry of
+>       accepted <- case entry of
 >         Nothing  -> do
 >           -- Case 1.
 >           newPendV <- newEmptyMVar
@@ -206,26 +221,75 @@ the lock on it.
 >           e <- Event.new
 >           let newPend = Pending 
 >                   { protocol = prot
->                   , clients = Map.insert r conn Map.empty
+>                   , clients = Map.insert role conn Map.empty
 >                   , assignments = ass 
->                   , waiting = Set.delete r $ Map.keysSet ass
+>                   , waiting = Set.delete role $ Map.keysSet ass
 >                   , assembled = e
 >                   }
 >           putMVar newPendV newPend
->           seq newPend (return ()) -- force evaluation
+>           seq newPend (return True) -- force evaluation
 
 
 >         (Just pv) -> do
->           -- Cases 2/3.
->           p <- takeMVar pv
+>           p@(Pending _ cs _ w _) <- takeMVar pv
 
 We now no longer need a lock on the global state as we are only interested in
 this particular pending session, which we have now locked.
 
 >           putMVar stateV state
->           -- 2/3.
->           
+>           case Set.member role w of
+>             False -> do
+>               -- Case 2.
+>               WS.sendClose conn ("Role has already been taken" :: Text)
+>               return False
+>             True -> do
+>               let p' = p & field @"clients" .~ Map.insert role conn cs
+>                          & field @"waiting" .~ Set.delete role w
+>               putMVar pv p'
+>               seq p' (return True)
+
+We have released our locks on first the global state and then on the pending session.
+We should check to see if the connection was 'accepted' or not, and if not we should
+check to see if all the roles are now 'assembled'
+
+>       case accepted of
+>         False -> return ()
+>         True -> do
+>           state <- takeMVar stateV
+>           let entry = Map.lookup (prot, ass) (pending state)
+>           accepted <- case entry of
+>             Nothing   -> putMVar stateV state
+
+The state has been modified by another thread, so it is no longer pending (now
+an active session) - we can relax!
+
+>             (Just pv) -> do
+>               p@(Pending _ cs _ w e) <- takeMVar pv
+>               case Set.null w of
+>                 False -> do
+>                   putMVar pv p
+>                   putMVar stateV state
+
+We are still waiting for more roles to connect - release the pending and global
+states.
+
+>                 True  -> do
+>                   let tok = nextToken state
+>                   let sess = Session cs ass tok
+>                   newSessV <- newMVar sess
+>                   let state' = state & field @"sessions" %~ Map.insert tok newSessV
+>                                      & field @"pending" %~ Map.delete (prot, ass)
+>                                      & field @"nextToken" %~ (+1)
+>                   putMVar stateV state'
+>                   seq state' (return ())
+
+Set the 'assembled' event, so the other clients can now continue to the 'proxy'
+stage.
+
+>                   Event.set e
+
 >           return undefined  
+
 
   case res of
     Just ((slots, e), conn) 
@@ -242,9 +306,6 @@ this particular pending session, which we have now locked.
         cons <- fst <$> readMVar state
         proxy conn cons
     Nothing -> putStrLn "Connection rejected as slots are full!"
-
->  where
->    accept = undefined
 
 data Handled = UpdatedState Integer | AlreadyTaken | StartSession Pending
 

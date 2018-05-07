@@ -23,3 +23,5 @@ executable scribble-proxy
                      , aeson
                      , containers
                      , concurrent-extra
+                     , generic-lens
+                     , lens
