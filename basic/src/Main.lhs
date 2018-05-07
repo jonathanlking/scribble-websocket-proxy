@@ -328,6 +328,11 @@ We need to clean the session up.
 >                       putMVar stateV state'
 >                       seq state' (return ())
 
+> main :: IO ()
+> main = do
+>   print $ encode $ exampleReq
+>   state <- newMVar newState
+>   WS.runServer "127.0.0.1" 9160 $ application state
 
 handleReq :: ProxyState -> SessionReq -> WS.Connection -> IO (ProxyState, Handled)
 handleReq state@(ss, pend, i) (Req p rs ident r) conn
@@ -422,11 +427,11 @@ main = do
 
 Slot based proxy
 
-> main :: IO ()
-> main = do
->   print $ encode $ SMessage One "Hello world!"
->   state <- newState' >>= newMVar
->   WS.runServer "127.0.0.1" 9160 $ slotApplication state
+main :: IO ()
+main = do
+  print $ encode $ SMessage One "Hello world!"
+  state <- newState' >>= newMVar
+  WS.runServer "127.0.0.1" 9160 $ slotApplication state
 
 > type SlotState' = (Maybe WS.Connection, Maybe WS.Connection, Maybe WS.Connection)
 > type SlotState = (SlotState', Event)
