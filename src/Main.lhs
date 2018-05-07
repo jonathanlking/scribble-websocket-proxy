@@ -296,7 +296,7 @@ stage.
 
 The following will only be executed once the session has started
 
->           ss <- fmap sessions $ readMVar stateV
+>           ss <- sessions <$> readMVar stateV
 >           case Map.lookup tok ss of
 
 The session is over before this client even got a chance to communicate... This
