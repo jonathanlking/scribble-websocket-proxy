@@ -304,33 +304,30 @@ change during a session) and then proceed to the routing phase.
 
 >             (Just sessV) -> do
 >               cons <- getField @"clients" <$> readMVar sessV
->               flip finally disconnect $ do
+>               flip finally (disconnect cons) $ do
 >                 forever $ do
 >                   msg <- decode <$> WS.receiveData conn
 >                   case msg >>= (\(Message role b) -> (,) b <$> Map.lookup role cons) of
 >                     Nothing -> return () -- TODO: Do we really want to ignore?
 >                     (Just (body, conn)) -> WS.sendTextData conn body
 >               where
->                 disconnect = undefined
+>                 disconnect cons = do
+>                   state <- takeMVar stateV
+>                   case Map.member tok (sessions state) of
 
+The session has already been cleaned up - release the global state.
 
-  case res of
-    Just ((slots, e), conn) 
-      -> flip finally disconnect $ do
-        if full slots then do 
-          Event.set e
-          putStrLn "All parties present, time to send messages!"
-        else putStrLn "Still waiting for more people to join!"
-        putStrLn "masky!"
-        ms <- getMaskingState
-        putStrLn (show ms ++ " ms")
-        Event.wait e
-        putStrLn "after"
-        cons <- fst <$> readMVar state
-        proxy conn cons
-    Nothing -> putStrLn "Connection rejected as slots are full!"
+>                     False -> putMVar stateV state
 
-data Handled = UpdatedState Integer | AlreadyTaken | StartSession Pending
+We need to clean the session up.
+
+>                     True  -> do                     
+>                       putStrLn $ "Cleaning up session " ++ (show tok)
+>                       forM_ cons (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
+>                       let state' = state & field @"sessions" %~ Map.delete tok
+>                       putMVar stateV state'
+>                       seq state' (return ())
+
 
 handleReq :: ProxyState -> SessionReq -> WS.Connection -> IO (ProxyState, Handled)
 handleReq state@(ss, pend, i) (Req p rs ident r) conn
