@@ -43,15 +43,13 @@ Required for generic-lens:
 > import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar, threadDelay)
 > import Data.Aeson (encode, decode, ToJSON, FromJSON, ToJSONKey, FromJSONKey)
 > import GHC.Generics (Generic)
-> import Control.Concurrent.Event (Event)
-> import Control.Concurrent.Async (race_)
 > import Data.Map.Strict (Map)
 > import Data.Set (Set)
 > import Data.Ord (comparing)
 > import Data.Maybe (catMaybes)
+> import Data.Monoid ((<>))
 > import Data.Generics.Product (getField, field, upcast)
 > import System.IO (hFlush, stdout)
-> import qualified Control.Concurrent.Event as Event
 > import qualified Data.List as List
 > import qualified Data.Text as T
 > import qualified Data.Text.IO as T
@@ -209,14 +207,11 @@ proxy phase, otherwise we would block forever)
 >       return ()
 >     Just req@(Req prot ass role) -> do
 >       print req 
->       -- dump stateV
 >       state <- takeMVar stateV
->       putStrLn "Got the state"
 >       let entry = Map.lookup (prot, ass) (pending state)
 >       accepted <- case entry of
 >         Nothing  -> do
 >           -- Case 1.
->           print "case 1"
 >           newPendV <- newEmptyMVar
 >           let tok = nextToken state
 >           let state' = state & field @"pending" %~ Map.insert (prot, ass) newPendV
@@ -253,14 +248,12 @@ this particular pending session, which we have now locked.
 >           case Set.member role w of
 >             False -> do
 >               -- Case 2.
->               print "case 2"
 >               WS.sendClose conn ("Role has already been taken" :: Text)
->               putStrLn "Role has already been taken"
+>               putStrLn $ "Role `" <> show role <> "` has already been taken"
 >               putMVar pv p
 >               return Nothing 
 >             True -> do
 >               -- Case 3.
->               print "case 3"
 >               let p' = p & field @"clients" .~ Map.insert role conn cs
 >                          & field @"waiting" .~ Set.delete role w
 >               putMVar pv p'
@@ -299,48 +292,15 @@ states.
 >                   putMVar stateV state'
 >                   seq state' (return ())
 
-Set the 'assembled' event, so the other clients can now continue to the
+Set the session to active, so the other clients can now continue to the
 'routing' phase.
 
 >                   putMVar a True
->           putStrLn "Waiting for assembly"
->           onException (race_ (forever $ WS.receiveDataMessage conn >> print "rec") (readMVar a)) $ do -- \(ex :: SomeException) -> do
->--           onException (readMVar a) $ do -- \(ex :: SomeException) -> do
 
-receiveDataMessage
+This will block on other threads until it has been 'put' by the final client
 
-The client has disconnected before the session has started - remove the
-connection from the pending session
-
->--             print ex
->             putStrLn $ show role ++ " died before session started..."
->             threadDelay 100000
->             state <- takeMVar stateV
->             print "After state"
->             let entry = Map.lookup (prot, ass) (pending state)
->             case entry of
->               Nothing   -> do 
-
-The session has now become active, another thread has removed the pending state
-and we have yet to receive the 'assembled' event. TODO: We should probably close
-the connection...
-
->                 putMVar stateV state
->               (Just pv) -> do
->                 print "the impossible didn't happen!"
->                 p <- takeMVar pv
->                 let p' = p & field @"clients" %~ Map.delete role
->                            & field @"waiting" %~ Set.insert role
->                 putMVar pv p'
->                 print "the impossible didn't happen near the end!"
->                 seq p' (return ())
->                 putMVar stateV state
->                 print "the impossible didn't happen in the end!"
-
->             putStrLn $ show role ++ " died before session started..."
->             hFlush stdout
+>           readMVar a
 >           WS.sendTextData conn $ encode ass
->           myThreadId >>= print
 
 
 The following will only be executed once the session has started:
@@ -351,7 +311,7 @@ The following will only be executed once the session has started:
 The session is over before this client even got a chance to communicate... This
 is because another client disconnected and destroyed the session concurrently.
 
->             Nothing -> print "ded" >> return ()
+>             Nothing -> return ()
 
 We will get the assignment of roles to connections (once, as this shouldn't
 change during a session) and then proceed to the routing phase.
@@ -388,7 +348,6 @@ We need to clean the session up.
 >                     True  -> do                     
 >                       putStrLn $ "Cleaning up session " ++ (show tok)
 >                       modifyMVar_ a (const $ return False)
->--                       forM_ cons (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
 >                       let state' = state & field @"sessions" %~ Map.delete tok
 >                       putMVar stateV state'
 >                       seq state' (return ())
