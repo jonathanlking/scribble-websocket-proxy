@@ -36,11 +36,11 @@ Required for generic-lens:
 > import Data.Monoid (mappend)
 > import Data.Text (Text)
 > import Data.Function (on)
-> import Control.Exception (finally, getMaskingState)
+> import Control.Exception (finally, catch, getMaskingState, SomeException, onException, uninterruptibleMask_ )
 > import Control.Monad (forever)
 > import Control.Lens ((%~), (&), (.~))
 > import Data.Foldable (forM_)
-> import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar)
+> import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar, threadDelay)
 > import Data.Aeson (encode, decode, ToJSON, FromJSON, ToJSONKey, FromJSONKey)
 > import GHC.Generics (Generic)
 > import Control.Concurrent.Event (Event)
@@ -49,6 +49,7 @@ Required for generic-lens:
 > import Data.Ord (comparing)
 > import Data.Maybe (catMaybes)
 > import Data.Generics.Product (getField, field, upcast)
+> import System.IO (hFlush, stdout)
 > import qualified Control.Concurrent.Event as Event
 > import qualified Data.List as List
 > import qualified Data.Text as T
@@ -203,15 +204,18 @@ proxy phase, otherwise we would block forever)
 >   case mreq of
 >     Nothing -> do 
 >       WS.sendClose conn ("Could not parse proxy request" :: Text)
->       print "Unable to parse proxy request"
+>       putStrLn "Unable to parse proxy request"
 >       return ()
->     Just (Req prot ass role) -> do
->       print ass 
+>     Just req@(Req prot ass role) -> do
+>       print req 
+>       -- dump stateV
 >       state <- takeMVar stateV
+>       putStrLn "Got the state"
 >       let entry = Map.lookup (prot, ass) (pending state)
 >       accepted <- case entry of
 >         Nothing  -> do
 >           -- Case 1.
+>           print "case 1"
 >           newPendV <- newEmptyMVar
 >           let tok = nextToken state
 >           let state' = state & field @"pending" %~ Map.insert (prot, ass) newPendV
@@ -248,9 +252,14 @@ this particular pending session, which we have now locked.
 >           case Set.member role w of
 >             False -> do
 >               -- Case 2.
+>               print "case 2"
 >               WS.sendClose conn ("Role has already been taken" :: Text)
+>               putStrLn "Role has already been taken"
+>               putMVar pv p
 >               return Nothing 
 >             True -> do
+>               -- Case 3.
+>               print "case 3"
 >               let p' = p & field @"clients" .~ Map.insert role conn cs
 >                          & field @"waiting" .~ Set.delete role w
 >               putMVar pv p'
@@ -293,7 +302,42 @@ Set the 'assembled' event, so the other clients can now continue to the
 'routing' phase.
 
 >                   Event.set e
->           Event.wait e
+>           putStrLn "Waiting for assembly"
+>           onException (getMaskingState >>= print >> Event.wait e) $ do -- \(ex :: SomeException) -> do
+
+The client has disconnected before the session has started - remove the
+connection from the pending session
+
+>--             print ex
+>             putStrLn $ show role ++ " died before session started..."
+>             threadDelay 100000
+>             state <- takeMVar stateV
+>             print "After state"
+>             let entry = Map.lookup (prot, ass) (pending state)
+>             case entry of
+>               Nothing   -> do 
+
+The session has now become active, another thread has removed the pending state
+and we have yet to receive the 'assembled' event. TODO: We should probably close
+the connection...
+
+>                 putMVar stateV state
+>               (Just pv) -> do
+>                 print "the impossible didn't happen!"
+>                 p <- takeMVar pv
+>                 let p' = p & field @"clients" %~ Map.delete role
+>                            & field @"waiting" %~ Set.insert role
+>                 putMVar pv p'
+>                 print "the impossible didn't happen near the end!"
+>                 seq p' (return ())
+>                 putMVar stateV state
+>                 print "the impossible didn't happen in the end!"
+
+>             putStrLn $ show role ++ " died before session started..."
+>             hFlush stdout
+>           WS.sendTextData conn $ encode ass
+>           print "bar"
+
 
 The following will only be executed once the session has started:
 
@@ -312,12 +356,19 @@ change during a session) and then proceed to the routing phase.
 >               cons <- getField @"clients" <$> readMVar sessV
 >               flip finally (disconnect cons) $ do
 >                 forever $ do
->                   msg <- decode <$> WS.receiveData conn
+>                   msg' <- WS.receiveData conn
+>                   let msg = decode msg'
+>                   print (msg :: Maybe Message)
+>--                   msg <- decode <$> WS.receiveData conn
 >                   case msg >>= (\(Message role b) -> (,) b <$> Map.lookup role cons) of
->                     Nothing -> return () -- TODO: Do we really want to ignore?
->                     (Just (body, conn)) -> WS.sendTextData conn body
+>                     Nothing -> do
+>                       putStrLn "Something went wrong!" 
+>                       print msg'
+>                       print (msg :: Maybe Message)
+>--                     Nothing -> return () -- TODO: Do we really want to ignore?
+>                     (Just (body, conn)) -> WS.sendTextData conn (encode body)
 >               where
->                 disconnect cons = do
+>                 disconnect cons = uninterruptibleMask_ $ do
 >                   state <- takeMVar stateV
 >                   case Map.member tok (sessions state) of
 
@@ -340,7 +391,7 @@ We need to clean the session up.
 >   state <- newMVar newState
 >   WS.runServer "127.0.0.1" 9160 $ application state
 
-A helper function to dump the state of the server
+A helper function to dump the state of the server:
 
 > dump :: MVar State -> IO ()
 > dump sv = do
