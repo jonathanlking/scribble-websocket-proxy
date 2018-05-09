@@ -44,6 +44,7 @@ Required for generic-lens:
 > import Data.Aeson (encode, decode, ToJSON, FromJSON, ToJSONKey, FromJSONKey)
 > import GHC.Generics (Generic)
 > import Control.Concurrent.Event (Event)
+> import Control.Concurrent.Async (race_)
 > import Data.Map.Strict (Map)
 > import Data.Set (Set)
 > import Data.Ord (comparing)
@@ -110,7 +111,7 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 >   , assignments :: Map Role Ident
 >   , token       :: Integer
 >   , waiting     :: Set Role
->   , assembled   :: Event
+>   , active      :: MVar Bool
 >   } deriving (Generic)
 
 > instance Show Pending where
@@ -229,21 +230,21 @@ global state, so it's safe to release our lock on the global state.
 We should now create our new pending session and put it in the MVar, 'releasing'
 the lock on it.
 
->           e <- Event.new
+>           a <- newEmptyMVar
 >           let newPend = Pending 
 >                   { protocol = prot
 >                   , clients = Map.insert role conn Map.empty
 >                   , assignments = ass 
 >                   , token = tok
 >                   , waiting = Set.delete role $ Map.keysSet ass
->                   , assembled = e
+>                   , active = a
 >                   }
 >           putMVar newPendV newPend
->           seq newPend (return (Just (tok, e))) -- force evaluation
+>           seq newPend (return (Just (tok, a))) -- force evaluation
 
 
 >         (Just pv) -> do
->           p@(Pending _ cs _ tok w e) <- takeMVar pv
+>           p@(Pending _ cs _ tok w a) <- takeMVar pv
 
 We now no longer need a lock on the global state as we are only interested in
 this particular pending session, which we have now locked.
@@ -263,7 +264,7 @@ this particular pending session, which we have now locked.
 >               let p' = p & field @"clients" .~ Map.insert role conn cs
 >                          & field @"waiting" .~ Set.delete role w
 >               putMVar pv p'
->               seq p' (return (Just (tok, e)))
+>               seq p' (return (Just (tok, a)))
 
 We have released our locks on first the global state and then on the pending session.
 We should check to see if the connection was 'accepted' or not, and if not we should
@@ -271,7 +272,7 @@ check to see if all the roles are now 'assembled'
 
 >       case accepted of
 >         Nothing -> return ()
->         (Just (tok, e)) -> do
+>         (Just (tok, a)) -> do
 >           state <- takeMVar stateV
 >           let entry = Map.lookup (prot, ass) (pending state)
 >           case entry of
@@ -301,9 +302,12 @@ states.
 Set the 'assembled' event, so the other clients can now continue to the
 'routing' phase.
 
->                   Event.set e
+>                   putMVar a True
 >           putStrLn "Waiting for assembly"
->           onException (getMaskingState >>= print >> Event.wait e) $ do -- \(ex :: SomeException) -> do
+>           onException (race_ (forever $ WS.receiveDataMessage conn >> print "rec") (readMVar a)) $ do -- \(ex :: SomeException) -> do
+>--           onException (readMVar a) $ do -- \(ex :: SomeException) -> do
+
+receiveDataMessage
 
 The client has disconnected before the session has started - remove the
 connection from the pending session
@@ -336,7 +340,7 @@ the connection...
 >             putStrLn $ show role ++ " died before session started..."
 >             hFlush stdout
 >           WS.sendTextData conn $ encode ass
->           print "bar"
+>           myThreadId >>= print
 
 
 The following will only be executed once the session has started:
@@ -347,7 +351,7 @@ The following will only be executed once the session has started:
 The session is over before this client even got a chance to communicate... This
 is because another client disconnected and destroyed the session concurrently.
 
->             Nothing -> return ()
+>             Nothing -> print "ded" >> return ()
 
 We will get the assignment of roles to connections (once, as this shouldn't
 change during a session) and then proceed to the routing phase.
@@ -356,6 +360,9 @@ change during a session) and then proceed to the routing phase.
 >               cons <- getField @"clients" <$> readMVar sessV
 >               flip finally (disconnect cons) $ do
 >                 forever $ do
+>                   active <- readMVar a
+>                   if not active then WS.sendClose conn ("A client has closed the connection" :: Text)
+>                                 else return ()
 >                   msg' <- WS.receiveData conn
 >                   let msg = decode msg'
 >                   print (msg :: Maybe Message)
@@ -380,7 +387,8 @@ We need to clean the session up.
 
 >                     True  -> do                     
 >                       putStrLn $ "Cleaning up session " ++ (show tok)
->                       forM_ cons (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
+>                       modifyMVar_ a (const $ return False)
+>--                       forM_ cons (\conn -> WS.sendClose conn ("A client has closed the connection" :: Text))
 >                       let state' = state & field @"sessions" %~ Map.delete tok
 >                       putMVar stateV state'
 >                       seq state' (return ())

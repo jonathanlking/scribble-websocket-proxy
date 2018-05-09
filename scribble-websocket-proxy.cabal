@@ -25,3 +25,4 @@ executable scribble-websocket-proxy
                      , concurrent-extra
                      , generic-lens
                      , lens
+                     , async
