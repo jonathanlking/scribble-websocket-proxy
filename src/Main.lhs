@@ -41,7 +41,7 @@ Required for generic-lens:
 > import Control.Lens ((%~), (&), (.~))
 > import Data.Foldable (forM_)
 > import Control.Concurrent (MVar, newMVar, newEmptyMVar, modifyMVar_, modifyMVar, readMVar, myThreadId, takeMVar, putMVar, threadDelay)
-> import Data.Aeson (encode, decode, ToJSON, FromJSON, ToJSONKey, FromJSONKey)
+> import Data.Aeson (encode, decode, ToJSON, FromJSON, ToJSONKey, FromJSONKey, Value)
 > import GHC.Generics (Generic)
 > import Data.Map.Strict (Map)
 > import Data.Set (Set)
@@ -87,7 +87,7 @@ to underspecify - i.e. to introduce "don't care" identifiers for roles.
 > data Message
 >   = Message
 >   { to :: Role
->   , body :: Text
+>   , body :: Value
 >   } deriving (Generic, Show)
 > instance FromJSON Message
 > instance ToJSON Message
