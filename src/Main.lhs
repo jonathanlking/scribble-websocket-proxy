@@ -325,7 +325,7 @@ change during a session) and then proceed to the routing phase.
 >             (Just sessV) -> do
 >               sess0 <- readMVar sessV
 >               let conns = getField @"clients" sess0
->               flip finally (disconnect conns) $ do
+>               flip finally (disconnect conns) $
 >                 forever $ do
 
 If another client has disconnected, they will set the MVar "errored" to True and
@@ -334,7 +334,7 @@ destroy the session, so we should now close our connection. After calling
 
 >                   let { checkForError = do
 >                     errored <- readMVar (getField @"errored" sess0)
->                     when errored $ WS.sendClose conn ("A client has closed the connection" :: Text) }
+>                     when errored $ WS.sendClose conn ("Error: A client has closed the connection" :: Text) }
 >                   checkForError
 
 Wait to receive a message from the client
@@ -350,7 +350,7 @@ Decrement the number of clients active
 
 If all clients are now ready to close, we should release the barrier
 
->                     when (getField @"active" sess' >= 0)
+>                     when (getField @"active" sess' == 0)
 >                       $ putMVar (getField @"complete" sess0) ()
 
 >                     putMVar sessV sess'
@@ -362,7 +362,7 @@ happens first)
 >                     race_ (forever $ checkForError >> threadDelay 1000) $ do
 >                       readMVar $ getField @"complete" sess0
 >                       WS.sendTextData conn (encode ("Session complete" :: Text))
->                       WS.sendClose conn ("A client has closed the connection" :: Text)
+>                       WS.sendClose conn ("The session is complete!" :: Text)
 >                   else do
 >                     let msg = decode msg'
 >                     case msg >>= (\(Message role b) -> (,) b <$> Map.lookup role conns) of
@@ -391,7 +391,6 @@ We need to clean the session up.
 
 > main :: IO ()
 > main = do
->   putStrLn $ show $ encode $ exampleReq
 >   state <- newMVar newState
 >   WS.runServer "127.0.0.1" 9160 $ application state
 
